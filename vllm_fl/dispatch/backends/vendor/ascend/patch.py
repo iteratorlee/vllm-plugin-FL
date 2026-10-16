@@ -55,8 +55,8 @@ def patch_causal_conv1d():
         ):
             """Pure-PyTorch causal_conv1d_update for Ascend NPU.
 
-            Uses causal_conv1d_ref for each sequence. Moves small index
-            tensors to CPU once to avoid per-iteration NPU sync.
+            Keep decode state indices on device so NPUGraph replay can use
+            the current request-to-state mapping, including padding slots.
             """
             if isinstance(activation, bool):
                 activation = "silu" if activation else None
@@ -68,19 +68,20 @@ def patch_causal_conv1d():
 
             _, width = weight.shape
 
-            # Move small index tensors to CPU once
-            if conv_state_indices is not None:
-                csi_cpu = conv_state_indices.cpu().tolist()
-            else:
-                csi_cpu = None
-
             if query_start_loc is None:
                 batch = x.shape[0]
                 for i in range(batch):
-                    idx = csi_cpu[i] if csi_cpu is not None else i
-                    if pad_slot_id is not None and csi_cpu is not None and idx == pad_slot_id:
-                        continue
-                    state = conv_state[idx]  # (dim, state_len)
+                    idx = (conv_state_indices[i:i+1].long()
+                           if conv_state_indices is not None else
+                           torch.full((1,), i, dtype=torch.long, device=x.device))
+                    valid = (idx != pad_slot_id if pad_slot_id is not None else
+                             torch.ones_like(idx, dtype=torch.bool))
+                    idx = idx.clamp_min(0)
+                    # gather stays native in the Ascend FlagGems blacklist;
+                    # FlagGems index_select copies the entire state pool.
+                    state = torch.gather(
+                        conv_state, 0, idx.view(1, 1, 1).expand(1, *conv_state.shape[1:])
+                    ).squeeze(0)
                     xi = x[i]  # (dim, seqlen)
                     seqlen = xi.shape[-1]
                     combined = torch.cat([state[..., -(width-1):], xi], dim=-1)
@@ -90,11 +91,21 @@ def patch_causal_conv1d():
                         weight.unsqueeze(1), bias,
                         padding=0, groups=dim_size,
                     ).squeeze(0)[..., :seqlen]
-                    conv_state[idx, :, -(width-1):] = combined[..., -(width-1):]
+                    updated = state.clone()
+                    updated[..., -(width-1):] = combined[..., -(width-1):]
+                    # Sequential masked writes preserve slot 0 even if padding
+                    # indices alias it after clamping.
+                    updated = torch.where(valid, updated, state)
+                    # FlagGems index_copy_ validates indices via a host sync.
+                    torch.ops.npu.npu_scatter_nd_update_(
+                        conv_state, idx.view(1, 1), updated.unsqueeze(0)
+                    )
                     if activation in ["silu", "swish"]:
                         out_i = F.silu(out_i)
-                    x[i] = out_i
+                    x[i] = torch.where(valid, out_i, x[i])
             else:
+                csi_cpu = (conv_state_indices.cpu().tolist()
+                           if conv_state_indices is not None else None)
                 qsl_cpu = query_start_loc.cpu().tolist()
                 batch = len(qsl_cpu) - 1
                 for i in range(batch):
@@ -448,18 +459,12 @@ def patch_gdn_triton_ops():
               h = h + beta * (v - h @ k) ⊗ k
               o = h @ q
             """
-            # Sync on first call to ensure prefill NPU ops have completed
-            if not hasattr(_proper_packed_decode, '_synced'):
-                _proper_packed_decode._synced = True
-                import torch_npu
-                torch.npu.synchronize()
             B_batch = mixed_qkv.shape[0]
             HV, V_dim, K_dim = initial_state.shape[-3:]
             qkv_dim = mixed_qkv.shape[1]
             qk_dim = qkv_dim - HV * V_dim
             H = qk_dim // (2 * K_dim)
             groups = HV // H
-            ssi_cpu = ssm_state_indices.cpu().tolist()
 
             # Compute gating for all tokens at once
             x = a.float() + dt_bias.float().unsqueeze(0)
@@ -468,10 +473,9 @@ def patch_gdn_triton_ops():
             beta_vals = torch.sigmoid(b.float())  # [B, HV]
 
             for i_n in range(B_batch):
-                state_idx = ssi_cpu[i_n]
-                if state_idx < 0:
-                    out[i_n, 0, :, :] = 0
-                    continue
+                state_idx = ssm_state_indices[i_n:i_n+1].long()
+                valid = state_idx >= 0
+                state_idx = state_idx.clamp_min(0)
 
                 # Extract q, k, v from packed mixed_qkv
                 q_start, k_start, v_start = 0, H * K_dim, 2 * H * K_dim
@@ -489,11 +493,14 @@ def patch_gdn_triton_ops():
                     b_q = b_q.repeat_interleave(groups, dim=0)
                     b_k = b_k.repeat_interleave(groups, dim=0)
 
-                h = initial_state[state_idx].float()  # [HV, V, K]
+                state = torch.gather(
+                    initial_state, 0,
+                    state_idx.view(1, 1, 1, 1).expand(1, *initial_state.shape[1:]),
+                ).squeeze(0)
+                h = state.float()  # [HV, V, K]
                 # Safety net: zero out if state contains garbage
                 # (NaN/Inf from uninitialized memory)
-                if torch.isnan(h).any() or torch.isinf(h).any():
-                    h = torch.zeros_like(h)
+                h = torch.where(torch.isfinite(h).all(), h, torch.zeros_like(h))
 
                 gt = g_vals[i_n]  # [HV]
                 bt = beta_vals[i_n]  # [HV]
@@ -507,8 +514,11 @@ def patch_gdn_triton_ops():
                 # Output: o = h @ q
                 b_o = torch.bmm(h, b_q.unsqueeze(-1)).squeeze(-1)  # [HV, V]
 
-                out[i_n, 0] = b_o.to(out.dtype)
-                initial_state[state_idx] = h.to(initial_state.dtype)
+                out[i_n, 0] = torch.where(valid, b_o.to(out.dtype), 0)
+                updated = torch.where(valid, h.to(initial_state.dtype), state)
+                torch.ops.npu.npu_scatter_nd_update_(
+                    initial_state, state_idx.view(1, 1), updated.unsqueeze(0)
+                )
 
             return out, initial_state
 

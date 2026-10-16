@@ -302,6 +302,23 @@ def _prepare_expert_assignment(
 
 
 class TritonExpertsFL(TritonExperts):
+    def workspace_shapes(
+        self, M, N, K, topk, global_num_experts, local_num_experts,
+        expert_tokens_meta, activation,
+    ):
+        workspace13, workspace2, output = super().workspace_shapes(
+            M, N, K, topk, global_num_experts, local_num_experts,
+            expert_tokens_meta, activation,
+        )
+        if get_platform_name() == "ascend":
+            # Ascend skips profile_run. Reserve prefill capacity during the
+            # first decode warmup, before capture fixes workspace addresses
+            # and capture_model locks the shared workspace against growth.
+            max_tokens = max(M, self.moe_config.max_num_tokens)
+            workspace13 = (max_tokens, *workspace13[1:])
+            workspace2 = (max_tokens, *workspace2[1:])
+        return workspace13, workspace2, output
+
     def apply(
         self,
         output: torch.Tensor,

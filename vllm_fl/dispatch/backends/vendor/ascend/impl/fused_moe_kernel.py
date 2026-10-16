@@ -4,8 +4,8 @@
 Ascend NPU pure-torch MoE kernels.
 
 Replaces FlagGems Triton kernels that crash on Ascend NPU.
-Uses a CPU side-channel to pass moe_align data to the GEMM kernel,
-avoiding any NPU→CPU transfers during the hot path.
+Unquantized naive decode keeps routing on device for NPUGraph replay;
+aligned batches retain the CPU routing implementation.
 """
 
 import torch
@@ -100,12 +100,43 @@ def invoke_fused_moe_torch(
     use_int8_w8a8: bool = False,
     B_bias: torch.Tensor | None = None,
 ):
-    """Ascend NPU fused MoE GEMM using per-expert torch.mm loop.
+    """Ascend NPU MoE GEMM with capture-safe unquantized naive decode.
 
     npu_grouped_matmul is disabled — it crashes aicore on MoE models like
     Qwen3.6-35B-A3B (error 507015: aicore execution abnormal). The torch.mm
     loop is slightly slower but reliable.
     """
+    if (
+        sorted_token_ids is None and not use_fp8_w8a8 and not use_int8_w8a8
+        and B.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        # One output row per token/expert pair. Routing must stay live on
+        # device: CPU lists would freeze the experts selected during capture.
+        _, n, k = B.shape
+        output = C.view(-1, n)
+        pairs = min(expert_ids.numel(), output.shape[0])
+        ids = expert_ids[:pairs].long()
+        valid = ids >= 0
+        safe_ids = ids.clamp_min(0)
+        # Keep the existing native mm path. The fixed pair count is unrolled
+        # during capture; each replay gathers the currently routed weights.
+        for pair in range(pairs):
+            weight = torch.gather(
+                B, 0, safe_ids[pair:pair+1].view(1, 1, 1).expand(1, n, k)
+            ).squeeze(0)
+            row = pair // max(top_k, 1)
+            result = torch.mm(A[row:row+1], weight.t())
+            if B_bias is not None:
+                result = result + torch.gather(
+                    B_bias, 0, safe_ids[pair:pair+1].view(1, 1).expand(1, n)
+                )
+            if mul_routed_weight and topk_weights is not None:
+                result = result * topk_weights.view(-1)[pair:pair+1].to(result.dtype)
+            output[pair:pair+1].copy_(
+                torch.where(valid[pair:pair+1], result, 0).to(C.dtype)
+            )
+        return
+
     # Use per-expert torch.mm loop — more reliable on Ascend NPU than
     # npu_grouped_matmul which can crash aicore on certain model shapes.
     _invoke_fused_moe_loop(
