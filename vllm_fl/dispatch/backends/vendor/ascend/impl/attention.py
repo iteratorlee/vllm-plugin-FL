@@ -622,7 +622,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         atten_mask=param.attn_mask,
                         block_table=metadata.block_tables,
                         input_layout="TND", block_size=param.block_size,
-                        actual_seq_lengths=metadata.actual_seq_lengths_q,
+                        # FULL decode has one query per (possibly padded)
+                        # request. FIA TND lengths must cover the fixed query.
+                        actual_seq_lengths=list(range(1, param.query.shape[0] + 1)),
                         actual_seq_lengths_kv=metadata.seq_lens_list,
                         num_key_value_heads=param.num_kv_heads,
                         num_heads=param.num_heads, scale=param.scale,

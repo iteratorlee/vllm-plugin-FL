@@ -98,14 +98,16 @@ def test_fia_capture_update_live_metadata_and_fixed_buffers(runtime, window):
     assert isinstance(param, rt.ns["FusedInferAttentionGraphParam"])
     capture = rt.calls[-1][1]
     live = _metadata(rt, 133)
-    live.actual_seq_lengths_q = [2]
+    live.actual_seq_lengths_q = [1, 1]
+    live.seq_lens_list = [133, 0]
     live.block_tables = torch.tensor([[2, 3], [1, 0]], dtype=torch.int32)
     update_stream = object()
     impl.update_graph_params(
         update_stream, SimpleNamespace(attn_metadata={"fia": live}), 2
     )
     update = rt.calls[-1][1]
-    assert update["actual_seq_lengths"] is live.actual_seq_lengths_q
+    assert update["actual_seq_lengths"] == [1, 2]
+    assert live.actual_seq_lengths_q == [1, 1]
     assert update["actual_seq_lengths_kv"] is live.seq_lens_list
     assert update["block_table"] is live.block_tables
     assert update["out"][0] is capture["out"][0] is output
