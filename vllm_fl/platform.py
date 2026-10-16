@@ -116,6 +116,9 @@ class PlatformFL(Platform):
     device_type = device_info.device_type
     dispatch_key = device_info.dispatch_key
     torch_device_fn = device_info.torch_device_fn
+    # NPU Inductor is not part of FL's Ascend graph path. Keep independently
+    # decorated helper functions on the eager backend.
+    simple_compile_backend: str = "eager" if device_type == "npu" else "inductor"
     ray_device_key: str = "GPU"
     dist_backend: str = (
         "flagcx"
@@ -288,6 +291,54 @@ class PlatformFL(Platform):
         enable_fused_activations_for_compile(compilation_config)
         if compilation_config.compile_sizes is None:
             compilation_config.compile_sizes = []
+
+        if cls.device_type == "npu":
+            from vllm.config import CompilationMode
+
+            enforce_eager = bool(
+                model_config is not None
+                and getattr(model_config, "enforce_eager", False)
+            )
+            if enforce_eager or compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+                compilation_config.mode = CompilationMode.NONE
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            elif compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                compilation_config.mode = CompilationMode.VLLM_COMPILE
+                compilation_config.backend = "eager"
+                compilation_config.use_inductor = False
+                compilation_config.splitting_ops = []
+                # These post-passes are CUDA/Inductor-specific. The eager FX
+                # graph is used only to drive the existing NPUGraph wrapper.
+                compilation_config.pass_config.fuse_norm_quant = False
+                compilation_config.pass_config.fuse_act_quant = False
+                compilation_config.pass_config.fuse_attn_quant = False
+                compilation_config.cudagraph_num_of_warmups = 1
+                logger.info(
+                    "Enabling Ascend FULL_DECODE_ONLY with eager FX and NPUGraph."
+                )
+            else:
+                logger.warning(
+                    "Ascend FL currently supports only NONE or "
+                    "FULL_DECODE_ONLY graph mode; falling back to NONE from %s.",
+                    compilation_config.cudagraph_mode,
+                )
+                compilation_config.mode = CompilationMode.NONE
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        # Ascend NPU: force float32 SSM state cache for GDN linear attention.
+        # The pure-PyTorch recurrence accumulates state in float32 but writes
+        # back to initial_state.dtype each step. If the cache is bf16, the
+        # round-trip truncation compounds across hundreds of tokens, degrading
+        # output quality (especially at temperature > 0). Forcing float32 cache
+        # eliminates this precision loss with negligible memory impact (the SSM
+        # state is small relative to the KV cache).
+        if cls.device_type == "npu":
+            if cache_config and cache_config.mamba_ssm_cache_dtype is None:
+                cache_config.mamba_ssm_cache_dtype = "float32"
+                logger.info(
+                    "Forcing mamba_ssm_cache_dtype to float32 for Ascend NPU "
+                    "to avoid recurrence precision loss in GDN decode."
+                )
 
         if (
             cls.device_type == "musa"
