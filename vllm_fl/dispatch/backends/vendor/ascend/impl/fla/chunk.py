@@ -38,6 +38,13 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
+        # vLLM stores recurrent state as [N, HV, V, K], while the pinned
+        # Ascend FlagGems chunk kernel consumes/returns [N, HV, K, V].
+        # Equal K/V dimensions otherwise hide this mismatch until decode.
+        chunk_initial_state = (
+            initial_state.transpose(-1, -2).contiguous()
+            if initial_state is not None else None
+        )
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
             k=k,
@@ -45,12 +52,14 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             g=g,
             beta=beta,
             scale=scale,
-            initial_state=initial_state,
+            initial_state=chunk_initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        if final_state is not None:
+            final_state = final_state.transpose(-1, -2).contiguous()
         return o.to(q.dtype), final_state
 
 

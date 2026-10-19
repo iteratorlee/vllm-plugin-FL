@@ -1016,9 +1016,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
-        # Reshape and cache KV
-        if attn_metadata != AscendAttentionState.DecodeOnly:
-            kv_cache = [i.contiguous() for i in kv_cache]
+        # The Ascend runner retains contiguous K/V-first views. Preserve the
+        # engine's cache allocation instead of copying it during forward.
         if key is not None and value is not None:
             key = key.contiguous()
             value = value.contiguous()

@@ -7935,6 +7935,12 @@ class ModelRunnerFL(
             kernel_block_sizes: The kernel block sizes for each KV cache group.
         """
 
+        # Ascend ATB cache operators require contiguous K/V views. Keep the
+        # allocation in K/V-first order instead of interleaving the pages and
+        # copying the complete cache during each forward.
+        if current_platform.device_type == "npu":
+            return
+
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             if not isinstance(kv_cache_spec, AttentionSpec):

@@ -93,3 +93,11 @@ The adapter keeps GDN decode state indices on device, updates native attention
 tasks with live lengths, preserves padded FIA query lengths, and reserves MoE
 workspace before capture locks its addresses. vLLM 0.28's large-batch top-k/top-p
 filter uses its Torch implementation on Ascend, outside model graph execution.
+GDN prefill converts vLLM's `[N, HV, V, K]` recurrent state to the pinned
+FlagGems kernel's `[N, HV, K, V]` layout and converts the result back before
+decode. Equal K/V dimensions make this a numerical compatibility requirement
+even though the tensor shapes agree.
+The prefill convolution also preserves the token-major feature layout required
+by vLLM's fused post-conv kernel. Ascend retains contiguous K/V-first caches;
+vision attention preserves image/window boundaries and bounds temporary memory
+by processing at most 256 query rows at a time.

@@ -81,7 +81,7 @@ def causal_conv1d_fn(
     validate_data: bool = False,
 ):
     """
-    x: (batch, dim, seqlen) or (dim,cu_seq_len) for varlen
+    x: (dim, cu_seq_len) for varlen
         sequences are concatenated from left to right for varlen
     weight: (dim, width)
     bias: (dim,)
@@ -105,7 +105,8 @@ def causal_conv1d_fn(
             for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
-    out: (batch, dim, seqlen)
+    out: (dim, cu_seq_len), with contiguous features after transposing to
+        (cu_seq_len, dim)
     """
     if activation not in [None, "silu", "swish"]:
         raise NotImplementedError("activation must be None, silu, or swish")
@@ -127,7 +128,8 @@ def causal_conv1d_fn(
             continue
         state = (
             conv_states[cache_index][..., : (width - 1)]
-            if conv_states is not None and cache_index != null_block_id
+            if conv_states is not None
+            and (cache_indices is None or cache_index != null_block_id)
             else None
         )
         output, _ = causal_conv1d_ref(
@@ -142,7 +144,10 @@ def causal_conv1d_fn(
             else None,
         )
         out_ref_b.append(output)
-    return torch.cat(out_ref_b, dim=-1)
+    output = torch.cat(out_ref_b, dim=-1)
+    # The caller transposes [channels, tokens] back to [tokens, channels].
+    # vLLM 0.28's fused post-conv kernel requires feature stride == 1.
+    return output.transpose(0, 1).contiguous().transpose(0, 1)
 
 
 @triton.jit
