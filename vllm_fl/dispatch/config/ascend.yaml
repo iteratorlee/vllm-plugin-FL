@@ -45,6 +45,21 @@ op_backends:
     - flagos
     - reference
 
+
+  # Keep unquantized MoE decode routing on device during NPUGraph replay.
+  invoke_fused_moe_triton_kernel:
+    - vendor
+    - flagos
+  moe_align_block_size:
+    - vendor
+    - flagos
+  moe_sum:
+    - vendor
+    - flagos
+  topk_softmax:
+    - vendor
+    - flagos
+
 # FlagOS operator blacklist
 # These operators will NOT use FlagOS implementation even if FlagOS is enabled.
 flagos_blacklist:
@@ -107,6 +122,29 @@ flagos_blacklist:
   - _flash_attention_forward
   - scatter
   - scatter_
+  # Keep the validated FlagTree 0.6.1 / FlagGems 5.4 Ascend paths on native
+  # Torch for unsupported indexing kernels and large linear autotuning.
+  - exp
+  - exp_
+  - log
+  - index
+  - addmm
+  - true_divide_
+  - neg
+  - neg_
+  - abs
+  - abs_
+  - index_put
+  - index_put_
+  - _index_put_impl_
+  - argmax
+  - pow_scalar
+  - pow_tensor_scalar
+  - pow_tensor_tensor
+  - pow_tensor_scalar_
+  - pow_tensor_tensor_
+  - linear
+  - gelu
 
 # OOT (Out-of-Tree) operator blacklist
 # These operators will NOT be registered as OOT replacements.

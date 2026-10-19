@@ -10,6 +10,58 @@ import torch
 pytestmark = [pytest.mark.gpu, pytest.mark.functional]
 
 
+def test_ascend_conv_prefill_vllm028_interface(ascend_runtime):
+    """Warmup's positional cache arguments and null blocks must be supported."""
+    _, _, device = ascend_runtime
+    from vllm_fl.dispatch.backends.vendor.ascend.impl.causal_conv1d import (
+        causal_conv1d_fn,
+        causal_conv1d_ref,
+    )
+
+    x = torch.randn(16, 5, dtype=torch.bfloat16)
+    weight = torch.randn(16, 4, dtype=x.dtype)
+    states = torch.randn(3, 16, 3, dtype=x.dtype)
+    expected_state = states.clone()
+    first, _ = causal_conv1d_ref(
+        x[:, :3], weight, initial_states=states[1],
+        return_final_states=True, final_states_out=expected_state[1],
+    )
+    second, _ = causal_conv1d_ref(x[:, 3:], weight)
+    actual_state = states.to(device)
+    actual = causal_conv1d_fn(
+        x.to(device), weight.to(device), None, actual_state,
+        torch.tensor([0, 3, 5], dtype=torch.int32, device=device),
+        cache_indices=torch.tensor([1, 0], dtype=torch.int32, device=device),
+        has_initial_state=torch.tensor([True, True], device=device),
+        activation="silu", null_block_id=0, validate_data=False,
+    )
+    torch.testing.assert_close(actual.cpu(), torch.cat((first, second), dim=-1),
+                               rtol=0.02, atol=0.02)
+    torch.testing.assert_close(actual_state.cpu(), expected_state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("vocab_size", [513, 248320])
+def test_ascend_topk_topp_batch_eight(ascend_runtime, monkeypatch, vocab_size):
+    _, _, device = ascend_runtime
+    from vllm.v1.sample.ops import topk_topp_sampler as sampler
+    from vllm_fl.dispatch.backends.vendor.ascend import patch
+
+    monkeypatch.setattr(sampler, "apply_top_k_top_p", sampler.apply_top_k_top_p)
+    patch.patch_topk_topp_sampler()
+    logits = torch.randn(8, vocab_size)
+    k = torch.tensor([1, 4, 8, 32, 64, 128, 256, vocab_size], dtype=torch.int32)
+    p = torch.tensor([1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.3, 0.1])
+    for top_k, top_p in [(k, p), (k, None), (None, p)]:
+        expected = sampler.apply_top_k_top_p_pytorch(
+            logits.clone(), top_k, top_p,
+        )
+        actual = sampler.apply_top_k_top_p(
+            logits.to(device), top_k.to(device) if top_k is not None else None,
+            top_p.to(device) if top_p is not None else None,
+        )
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.fixture
 def ascend_runtime(backend, request, monkeypatch):
     # Do not import Ascend modules (or request an NPU device) on CPU/CUDA hosts.
@@ -122,6 +174,9 @@ def test_ascend_moe_naive_graph_replay(ascend_runtime, top_k, weighted, with_bia
     """Replay must use live experts/weights, including negative expert slots."""
     _, _, device = ascend_runtime
     from vllm_fl.dispatch.backends.vendor.ascend.impl import fused_moe_kernel as moe
+    from vllm_fl.dispatch import CachedOp
+
+    invoke_moe = CachedOp("invoke_fused_moe_triton_kernel")
 
     batch, experts, n, k = 4, 5, 16, 32
     dtype = torch.bfloat16
@@ -135,7 +190,7 @@ def test_ascend_moe_naive_graph_replay(ascend_runtime, top_k, weighted, with_bia
     config = {"BLOCK_SIZE_M": 16}
 
     def run(target):
-        moe.invoke_fused_moe_torch(
+        invoke_moe(
             inputs, weights, target, None, None, route_weights, None, ids,
             padded, weighted, top_k, config, B_bias=bias,
         )
@@ -180,6 +235,7 @@ def test_ascend_moe_workspace_after_capture(ascend_runtime, monkeypatch):
     import vllm.config
     from vllm.model_executor.layers.fused_moe import modular_kernel as mk
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import biased_moe_quant_config
     from vllm.v1.worker import workspace
     from vllm_fl.ops.fused_moe import fused_moe_utils as utils
 
@@ -192,7 +248,12 @@ def test_ascend_moe_workspace_after_capture(ascend_runtime, monkeypatch):
     ))
     manager = workspace.WorkspaceManager(device)
     monkeypatch.setattr(workspace, "_manager", manager)
-    experts = utils.TritonExpertsFL(SimpleNamespace(max_num_tokens=256), None)
+    config = SimpleNamespace(
+        max_num_tokens=256, swiglu_limit=None, swiglu_alpha=None,
+        swiglu_beta=None, activation_situ_beta=None,
+        activation_situ_linear_beta=None,
+    )
+    experts = utils.TritonExpertsFL(config, biased_moe_quant_config(None, None))
     kernel = object.__new__(mk.FusedMoEKernelModularImpl)
     kernel.fused_experts = experts
 
@@ -235,11 +296,7 @@ def test_ascend_gdn_graph_replay(ascend_runtime, transposed_conv_state, monkeypa
     # Undo the global kernel bindings installed by these patches after the test.
     for path in (
         "layers.mamba.ops.causal_conv1d", "models.qwen3_next",
-        "layers.mamba.gdn_linear_attn", "layers.fla.ops",
-        "layers.fla.ops.fused_sigmoid_gating",
-        "layers.fla.ops.fused_gdn_prefill_post_conv",
-        "layers.fla.ops.fused_recurrent", "layers.fla.ops.chunk",
-        "layers.fla.ops.l2norm",
+        "layers.mamba.gdn.qwen_gdn_linear_attn",
     ):
         module = importlib.import_module("vllm.model_executor." + path)
         for name, value in list(vars(module).items()):
@@ -249,8 +306,7 @@ def test_ascend_gdn_graph_replay(ascend_runtime, transposed_conv_state, monkeypa
 
     monkeypatch.setattr(l2norm, "l2norm_fwd", l2norm.l2norm_fwd)
     patch.patch_causal_conv1d()
-    patch.patch_gdn_triton_ops()
-    from vllm.model_executor.layers.mamba import gdn_linear_attn as gdn
+    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
 
     dtype = torch.bfloat16
     batch, slots, heads, kv_heads, kd, vd = 4, 6, 4, 2, 4, 8
@@ -294,10 +350,17 @@ def test_ascend_gdn_graph_replay(ascend_runtime, transposed_conv_state, monkeypa
             run(*expected)
             for target, source in zip((x, conv_state, state, out), fresh):
                 target.copy_(source)
+            torch.npu.synchronize()
             graph.replay()
             torch.npu.synchronize()
-            for actual, reference in zip((x, conv_state, state, out), expected):
-                torch.testing.assert_close(actual, reference, atol=0, rtol=0, equal_nan=True)
+            for name, actual, reference in zip(
+                ("conv_output", "conv_state", "ssm_state", "output"),
+                (x, conv_state, state, out), expected,
+            ):
+                torch.testing.assert_close(
+                    actual, reference, atol=0, rtol=0, equal_nan=True,
+                    msg=lambda message: f"{name}, indices={live_indices}: {message}",
+                )
     finally:
         torch.npu.synchronize()
         graph.reset()

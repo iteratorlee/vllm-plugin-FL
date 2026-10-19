@@ -50,6 +50,8 @@ def _load_platform_policy(monkeypatch):
     patch_module.refresh_block_size = lambda config: None
     shutdown_module = ModuleType("vllm_fl.patches.worker_shutdown")
     shutdown_module.patch_worker_shutdown = lambda: None
+    activation_module = ModuleType("vllm_fl.ops.activation")
+    activation_module.enable_fused_activations_for_compile = lambda config: None
     for name in (
         "vllm_fl",
         "vllm_fl.patches",
@@ -63,6 +65,7 @@ def _load_platform_policy(monkeypatch):
         monkeypatch.setitem(sys.modules, name, package)
     monkeypatch.setitem(sys.modules, patch_module.__name__, patch_module)
     monkeypatch.setitem(sys.modules, shutdown_module.__name__, shutdown_module)
+    monkeypatch.setitem(sys.modules, activation_module.__name__, activation_module)
 
     namespace = {
         "logger": SimpleNamespace(
@@ -83,7 +86,10 @@ def _load_platform_policy(monkeypatch):
 
 def _graph_config(cudagraph_mode, *, enforce_eager=False):
     return SimpleNamespace(
-        parallel_config=SimpleNamespace(worker_cls=None, data_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            worker_cls=None, data_parallel_size=1, tensor_parallel_size=1,
+            all2all_backend="allgather_reducescatter",
+        ),
         model_config=SimpleNamespace(
             use_mla=False,
             enforce_eager=enforce_eager,

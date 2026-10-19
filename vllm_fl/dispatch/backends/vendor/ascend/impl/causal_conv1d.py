@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
 
 
 def causal_conv1d_ref(
@@ -65,13 +65,20 @@ def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
     conv_states: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    cache_indices: Optional[torch.Tensor] = None,
     query_start_loc: Optional[torch.Tensor] = None,
-    metadata: Optional[Any] = None,
+    cache_indices: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
+    null_block_id: int = NULL_BLOCK_ID,
+    block_idx_first_scheduled_token: Optional[torch.Tensor] = None,
+    block_idx_last_scheduled_token: Optional[torch.Tensor] = None,
+    initial_state_idx: Optional[torch.Tensor] = None,
+    num_computed_tokens: Optional[torch.Tensor] = None,
+    block_size_to_align: int = 0,
+    metadata: Optional[Any] = None,
+    validate_data: bool = False,
 ):
     """
     x: (batch, dim, seqlen) or (dim,cu_seq_len) for varlen
@@ -106,7 +113,6 @@ def causal_conv1d_fn(
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
 
-    out_ref = []
     out_ref_b = []
     seqlens = query_start_loc[1:] - query_start_loc[:-1]
     seqlens = seqlens.tolist()
@@ -115,24 +121,28 @@ def causal_conv1d_fn(
 
     for i in range(len(seqlens)):
         x_s = splits[i]
-        if cache_indices[i] == PAD_SLOT_ID:
+        cache_index = i if cache_indices is None else int(cache_indices[i])
+        if cache_index == pad_slot_id:
+            out_ref_b.append(torch.zeros_like(x_s))
             continue
-        out_ref_b.append(
-            causal_conv1d_ref(
-                x_s,
-                weight,
-                bias,
-                activation=activation,
-                return_final_states=True,
-                final_states_out=conv_states[cache_indices[i]][..., : (width - 1)].unsqueeze(0),
-                initial_states=conv_states[cache_indices[i]][..., : (width - 1)]
-                if has_initial_state[i]
-                else None,
-            )
+        state = (
+            conv_states[cache_index][..., : (width - 1)]
+            if conv_states is not None and cache_index != null_block_id
+            else None
         )
-    out_ref.append(torch.cat([t[0] for t in out_ref_b], dim=-1))
-    out_ref_tensor = torch.cat(out_ref, dim=0)
-    return out_ref_tensor
+        output, _ = causal_conv1d_ref(
+            x_s,
+            weight,
+            bias,
+            activation=activation,
+            return_final_states=state is not None,
+            final_states_out=state,
+            initial_states=state
+            if has_initial_state is not None and bool(has_initial_state[i])
+            else None,
+        )
+        out_ref_b.append(output)
+    return torch.cat(out_ref_b, dim=-1)
 
 
 @triton.jit
@@ -530,6 +540,43 @@ def _causal_conv1d_update_kernel_npu_tiled(
             tl.store(o_ptrs, acc, mask=lane_active & mask_w)
 
 
+def _causal_conv1d_decode(
+    x, conv_state, weight, bias, activation, conv_state_indices, pad_slot_id,
+):
+    """Update regular decode state with live device indices during replay."""
+    dtype = x.dtype
+    squeeze = x.ndim == 2
+    x = x.to(conv_state.dtype)
+    if squeeze:
+        x = x.unsqueeze(-1)
+    history = weight.shape[-1] - 1
+    for row in range(x.shape[0]):
+        index = (conv_state_indices[row:row+1].long()
+                 if conv_state_indices is not None else
+                 torch.full((1,), row, dtype=torch.long, device=x.device))
+        valid = (index != pad_slot_id if pad_slot_id is not None else
+                 torch.ones_like(index, dtype=torch.bool))
+        index = index.clamp_min(0)
+        state = torch.gather(
+            conv_state, 0, index.view(1, 1, 1).expand(1, *conv_state.shape[1:]),
+        ).squeeze(0)
+        combined = torch.cat([state[..., -history:], x[row]], dim=-1)
+        result = F.conv1d(
+            combined.unsqueeze(0), weight.unsqueeze(1), bias,
+            groups=weight.shape[0],
+        ).squeeze(0)
+        updated = state.clone()
+        updated[..., -history:] = combined[..., -history:]
+        updated = torch.where(valid, updated, state)
+        torch.ops.npu.npu_scatter_nd_update_(
+            conv_state, index.view(1, 1), updated.unsqueeze(0),
+        )
+        if activation in (True, "silu", "swish"):
+            result = F.silu(result)
+        x[row].copy_(torch.where(valid, result, x[row]))
+    return (x.squeeze(-1) if squeeze else x).to(dtype)
+
+
 def causal_conv1d_update_npu(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -583,6 +630,15 @@ def causal_conv1d_update_npu(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen) or (num_tokens, dim), same shape as `x`
     """
+    if (
+        query_start_loc is None and num_accepted_tokens is None
+        and initial_state_idx is None and block_idx_last_scheduled_token is None
+        and weight.shape[-1] > 1
+    ):
+        return _causal_conv1d_decode(
+            x, conv_state, weight, bias, activation, conv_state_indices, pad_slot_id,
+        )
+
     if validate_data:
         assert pad_slot_id is not None
         assert x.stride(1) == 1
@@ -661,6 +717,10 @@ def causal_conv1d_update_npu(
 
     # token chunk based on block_n (32KB UB idea); conservative
     t_chunk = 20 if block_n == 512 else 48
+    # Decode has one token per sequence. Allocating the full prefill tile
+    # wastes UB space and can overflow the compiler's per-core allocation.
+    if query_start_loc is None:
+        t_chunk = min(t_chunk, triton.next_power_of_2(seqlen))
 
     def grid(META):
         return (

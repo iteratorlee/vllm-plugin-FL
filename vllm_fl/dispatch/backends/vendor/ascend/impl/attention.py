@@ -32,6 +32,8 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionLayer,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
     AttentionType,
 )
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -120,7 +122,7 @@ class AscendAttentionState(Enum):
 
 
 @dataclass
-class AscendMetadata:
+class AscendMetadata(AttentionMetadata):
     """Metadata for Ascend attention."""
 
     # Basic properties
@@ -245,11 +247,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
         )
 
 
-class AscendAttentionMetadataBuilder:
+class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """Builder for Ascend attention metadata."""
 
     # ACL graph support - ALWAYS means full graph capture is supported
     aclgraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
     reorder_batch_threshold: ClassVar[int] = 1
 
     @staticmethod
@@ -268,7 +271,7 @@ class AscendAttentionMetadataBuilder:
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        self.vllm_config = vllm_config
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
         self.device = device
         self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
@@ -334,6 +337,7 @@ class AscendAttentionMetadataBuilder:
         common_prefix_len: int,
         common_attn_metadata,
         model: Optional[nn.Module] = None,
+        fast_build: bool = False,
     ):
         """Build AscendMetadata from common attention metadata."""
         num_reqs = common_attn_metadata.num_reqs
@@ -471,7 +475,7 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ASCEND_FL"
+        return "CUSTOM"
 
     @staticmethod
     def get_impl_cls() -> Type["AscendAttentionBackendImpl"]:
@@ -523,6 +527,10 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_block_size() -> list[int]:
+        return [128]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
         return [128]
 
 
@@ -685,20 +693,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
             value = self.value_cache.view(num_block, block_size, -1)
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         elif attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            # num_block, block_size, _, _ = self.key_cache.shape
-            # key = self.key_cache.view(num_block, block_size, -1)
-            # value = self.value_cache.view(num_block, block_size, -1)
-            key = self.key_cache.view(-1, block_size, 256)
-            value = self.value_cache.view(-1, block_size, 256)
+            num_block, block_size, _, _ = self.key_cache.shape
+            key = self.key_cache.view(num_block, block_size, -1)
+            value = self.value_cache.view(num_block, block_size, -1)
             block_table = attn_metadata.block_tables
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         else:
             # ChunkedPrefill
-            # num_block, block_size, _, _ = self.key_cache.shape
-            # key = self.key_cache.view(num_block, block_size, -1)
-            # value = self.value_cache.view(num_block, block_size, -1)
-            key = self.key_cache.view(-1, block_size, 256)
-            value = self.value_cache.view(-1, block_size, 256)
+            num_block, block_size, _, _ = self.key_cache.shape
+            key = self.key_cache.view(num_block, block_size, -1)
+            value = self.value_cache.view(num_block, block_size, -1)
             block_table = attn_metadata.block_tables
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
 

@@ -172,6 +172,9 @@ If there are multiple plugins in the current environment, you can specify use vl
 
 ### Additional Steps for Ascend
 
+For the vLLM 0.28 empty build, pinned component versions, and decode graph
+validation, see [Ascend graph with vLLM 0.28](./docs/ascend-vllm028-graph.md).
+
 1. Install [FlagTree](https://github.com/flagos-ai/flagtree/)
 
     ```sh

@@ -67,6 +67,9 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    chunk_indices: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
+    core_attn_out: Optional[torch.Tensor] = None,
 ):
     r"""
     Args:
@@ -183,4 +186,6 @@ def chunk_gated_delta_rule(
     )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
+    if core_attn_out is not None:
+        core_attn_out.view(-1)[:o.numel()].copy_(o.reshape(-1))
     return o, final_state

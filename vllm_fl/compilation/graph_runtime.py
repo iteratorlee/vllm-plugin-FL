@@ -23,7 +23,9 @@ _GRAPH_CLASS_NAMES = {
 
 
 @contextmanager
-def _ascend_graph_capture(device: torch.device):
+def _ascend_graph_capture(
+    device: torch.device, graph_capture_context: GraphCaptureContext | None = None,
+):
     """Provide an isolated stream for Ascend NPUGraph capture.
 
     The capture stream waits for work already queued on the current stream
@@ -31,7 +33,7 @@ def _ascend_graph_capture(device: torch.device):
     current, while leaving it restores the previously active stream. The
     returned ``GraphCaptureContext`` exposes the capture stream to callers.
     """
-    capture_context = GraphCaptureContext(
+    capture_context = graph_capture_context or GraphCaptureContext(
         current_platform.torch_device_fn.Stream(device=device)
     )
     stream = capture_context.stream
