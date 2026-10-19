@@ -86,8 +86,31 @@ Repeat with `Qwen3.6-35B-A3B`. For each eager control, replace the graph
 configuration with `--enforce-eager` and retain its results separately.
 Each model/mode has five pytest scenarios containing 26 requests.
 
-With `VLLM_LOGGING_LEVEL=DEBUG`, verify both completed graph capture and real
-request batches with `cudagraph_mode: FULL`. Startup alone does not verify replay.
+To verify replay, enable DEBUG output for the plugin's logger as well as vLLM's
+logger before starting the service:
+
+```bash
+python3 - <<'PY'
+import copy
+import json
+from vllm.logger import DEFAULT_LOGGING_CONFIG
+
+config = copy.deepcopy(DEFAULT_LOGGING_CONFIG)
+config["handlers"]["vllm"]["level"] = "DEBUG"
+config["loggers"]["vllm"]["level"] = "DEBUG"
+config["loggers"]["vllm_fl"] = {
+    "handlers": ["vllm"], "level": "DEBUG", "propagate": False,
+}
+with open("logging-debug.json", "w") as output:
+    json.dump(config, output)
+PY
+export VLLM_LOGGING_CONFIG_PATH="$PWD/logging-debug.json"
+```
+
+Verify both completed graph capture and real request batches with
+`cudagraph_mode: FULL`, including padded sizes 1, 2, 4 and 8. Setting only
+`VLLM_LOGGING_LEVEL=DEBUG` does not enable the plugin's replay messages.
+Startup alone does not verify replay.
 
 The adapter keeps GDN decode state indices on device, updates native attention
 tasks with live lengths, preserves padded FIA query lengths, and reserves MoE
@@ -98,6 +121,9 @@ FlagGems kernel's `[N, HV, K, V]` layout and converts the result back before
 decode. Equal K/V dimensions make this a numerical compatibility requirement
 even though the tensor shapes agree.
 The prefill convolution also preserves the token-major feature layout required
-by vLLM's fused post-conv kernel. Ascend retains contiguous K/V-first caches;
+by vLLM's fused post-conv kernel. Ascend preserves hybrid cache pages shared
+with Mamba: contiguous native views span the interleaved K/V storage, while
+slot mappings and native block IDs account for the physical page stride.
+This avoids copying the entire cache or overwriting another group's pages;
 vision attention preserves image/window boundaries and bounds temporary memory
 by processing at most 256 query rows at a time.

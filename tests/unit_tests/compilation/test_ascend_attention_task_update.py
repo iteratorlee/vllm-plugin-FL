@@ -155,6 +155,46 @@ def test_mixed_tasks_use_layer_metadata_and_distinct_workspaces(runtime):
         event.record.assert_called_once()
 
 
+@pytest.mark.parametrize("window", [None, 8])
+def test_interleaved_cache_task_updates_retain_native_page_table(runtime, window):
+    rt = runtime
+    impl = _impl(rt, window)
+    impl.cache_block_stride = 2
+    query = torch.empty(2, 4, 8)
+    impl.forward_impl(query, query, query, (), _metadata(rt), torch.empty_like(query), "hybrid")
+    param = rt.state.attention_params[2][0]
+    torch.testing.assert_close(param.block_tables, _metadata(rt).block_tables * 2)
+    for offset in [1, 3]:
+        live = _metadata(rt, 133)
+        live.block_tables = live.block_tables + offset
+        impl.update_graph_params(object(), SimpleNamespace(attn_metadata={"hybrid": live}), 2)
+        native = rt.calls[-1][1]["block_table"]
+        assert native is param.runtime_block_tables
+        torch.testing.assert_close(native, live.block_tables * 2)
+
+
+def test_interleaved_cache_slot_mapping_preserves_padding(runtime):
+    rt = runtime
+    impl = _impl(rt, None)
+    impl.key_cache = impl.value_cache = None
+    storage = torch.zeros(2, 3, 128, 2, 8)
+    page = storage.shape[2:].numel()
+    storage.as_strided_(storage.shape, (page, 2*page, *storage.stride()[2:]))
+    metadata = _metadata(rt)
+    metadata.num_actual_tokens = 3
+    metadata.slot_mapping = torch.tensor([128, -1, 263], dtype=torch.int64)
+    op = Mock()
+    rt.ns["torch_npu"]._npu_reshape_and_cache = op
+    key, value = torch.randn(3, 2, 8), torch.randn(3, 2, 8)
+    impl.reshape_and_cache(key, value, storage, metadata)
+    native = op.call_args.kwargs
+    torch.testing.assert_close(native["slot_indices"], torch.tensor([256, -1, 519], dtype=torch.int32))
+    assert native["key_cache"].is_contiguous()
+    assert native["value_cache"].is_contiguous()
+    assert native["key_cache"].data_ptr() == storage[0].data_ptr()
+    assert native["value_cache"].data_ptr() == storage[1].data_ptr()
+
+
 def test_decode_builder_mask_for_sliding_window_only(runtime):
     cls = runtime.ns["AscendAttentionMetadataBuilder"]
     builder = object.__new__(cls)

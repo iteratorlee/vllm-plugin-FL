@@ -92,6 +92,9 @@ class PagedAttentionGraphParam:
     num_heads: int
     scale: float
     output: torch.Tensor
+    cache_block_stride: int = 1
+    block_tables: torch.Tensor | None = None
+    runtime_block_tables: torch.Tensor | None = None
 
 
 @dataclass
@@ -110,6 +113,9 @@ class FusedInferAttentionGraphParam:
     sparse_mode: int
     pre_tokens: int
     next_tokens: int
+    cache_block_stride: int = 1
+    block_tables: torch.Tensor | None = None
+    runtime_block_tables: torch.Tensor | None = None
 
 
 class AscendAttentionState(Enum):
@@ -623,12 +629,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     raise RuntimeError(
                         f"Missing Ascend graph metadata for {param.layer_name!r}"
                     )
+                # Keep transformed tables alive until the next replay's
+                # synchronization. They must reflect the current request's
+                # physical pages, including hybrid-cache interleaving.
+                param.runtime_block_tables = (
+                    metadata.block_tables * param.cache_block_stride
+                    if param.cache_block_stride != 1 else metadata.block_tables
+                )
+                block_tables = param.runtime_block_tables
                 if isinstance(param, FusedInferAttentionGraphParam):
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=param.query, key=param.key, value=param.value,
                         atten_mask=param.attn_mask,
-                        block_table=metadata.block_tables,
+                        block_table=block_tables,
                         input_layout="TND", block_size=param.block_size,
                         # FULL decode has one query per (possibly padded)
                         # request. FIA TND lengths must cover the fixed query.
@@ -653,7 +667,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_kv_heads=param.num_kv_heads,
                     num_heads=param.num_heads,
                     scale_value=param.scale,
-                    block_table=metadata.block_tables,
+                    block_table=block_tables,
                     context_lens=metadata.seq_lens,
                     out=param.output,
                 )
@@ -665,7 +679,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_kv_heads=param.num_kv_heads,
                     num_heads=param.num_heads,
                     scale_value=param.scale,
-                    block_table=metadata.block_tables,
+                    block_table=block_tables,
                     context_lens=metadata.seq_lens,
                     out=param.output,
                     workspace=workspace,
@@ -706,7 +720,33 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table = attn_metadata.block_tables
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
 
+        if block_table is not None:
+            block_table = self._native_block_tables(block_table)
         return key, value, block_size, block_table, actual_seq_lengths_kv
+
+    def _native_block_tables(self, block_tables: torch.Tensor) -> torch.Tensor:
+        stride = getattr(self, "cache_block_stride", 1)
+        return block_tables * stride if stride != 1 else block_tables
+
+    def _bind_native_cache_views(self, kv_cache: Tuple[torch.Tensor]):
+        key, value = kv_cache[0], kv_cache[1]
+        page_elements = key.shape[1:].numel()
+        stride = key.stride(0) // page_elements
+        if key.stride(0) != stride * page_elements or stride not in (1, 2):
+            raise ValueError("Unsupported Ascend KV cache page stride")
+        self.cache_block_stride = stride
+        if stride != 1:
+            # Hybrid groups share a raw pool whose physical pages contain
+            # [K, V] together. Expose contiguous views that include the
+            # intervening pages, then multiply native page IDs by two. This
+            # preserves the engine's allocation without copying its cache.
+            shape = ((key.shape[0] - 1) * stride + 1, *key.shape[1:])
+            strides = (page_elements, *key.stride()[1:])
+            key = key.as_strided(shape, strides)
+            value = value.as_strided(shape, strides)
+        if not key.is_contiguous() or not value.is_contiguous():
+            raise ValueError("Ascend native KV views must be contiguous")
+        self.key_cache, self.value_cache = key, value
 
     def reshape_and_cache(
         self,
@@ -718,8 +758,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """Reshape and cache key/value tensors."""
         if len(kv_cache) > 1:
             if self.key_cache is None:
-                self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+                self._bind_native_cache_views(kv_cache)
             slots = attn_metadata.slot_mapping
+            if self.cache_block_stride != 1:
+                block_size = self.key_cache.shape[1]
+                native_slots = slots + slots.div(
+                    block_size, rounding_mode="floor"
+                ) * (self.cache_block_stride - 1) * block_size
+                slots = torch.where(slots < 0, slots, native_slots)
             # torch_npu requires int32 for slot_indices
             # TODO(yxa): block_table.py: CUDA uses int64, NPU uses int32.
             if slots.dtype != torch.int32:
@@ -791,6 +837,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     softmax_lse=weak_ref_tensors(softmax_lse),
                     sparse_mode=sparse_mode, pre_tokens=pre_tokens,
                     next_tokens=next_tokens,
+                    cache_block_stride=getattr(self, "cache_block_stride", 1),
+                    block_tables=block_table,
                 )
             )
             torch.npu.graph_task_group_begin(stream)
@@ -843,6 +891,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_params = get_ascend_graph_params()
             assert graph_params is not None
             num_tokens = query.shape[0]
+            block_tables = self._native_block_tables(attn_metadata.block_tables)
             workspace = torch_npu._npu_paged_attention_get_workspace(
                 query=query,
                 key_cache=self.key_cache,
@@ -850,7 +899,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_kv_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 scale_value=self.scale,
-                block_table=attn_metadata.block_tables,
+                block_table=block_tables,
                 context_lens=attn_metadata.seq_lens,
                 out=output,
             )
@@ -871,6 +920,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_heads=self.num_heads,
                     scale=self.scale,
                     output=weak_ref_tensors(output),
+                    cache_block_stride=getattr(self, "cache_block_stride", 1),
+                    block_tables=block_tables,
                 )
             )
             torch.npu.graph_task_group_begin(stream)
@@ -881,7 +932,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_kv_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 scale_value=self.scale,
-                block_table=attn_metadata.block_tables,
+                block_table=block_tables,
                 context_lens=attn_metadata.seq_lens,
                 out=output,
                 workspace=workspace,
@@ -897,7 +948,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,
-            block_table=attn_metadata.block_tables,
+            block_table=self._native_block_tables(attn_metadata.block_tables),
             context_lens=attn_metadata.seq_lens,
             out=output
         )
@@ -1016,8 +1067,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
-        # The Ascend runner retains contiguous K/V-first views. Preserve the
-        # engine's cache allocation instead of copying it during forward.
+        # Native views preserve the engine's shared physical page layout.
         if key is not None and value is not None:
             key = key.contiguous()
             value = value.contiguous()

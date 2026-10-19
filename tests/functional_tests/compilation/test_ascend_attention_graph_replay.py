@@ -25,13 +25,14 @@ def test_ascend_vision_position_interpolation(ascend_runtime, grid):
 
 
 @pytest.mark.parametrize("head_size", [128, 256])
-def test_ascend_attention_forward_keeps_engine_cache(ascend_runtime, head_size):
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_ascend_attention_forward_keeps_engine_cache(ascend_runtime, head_size, hybrid):
     attention, _, device = ascend_runtime
     from vllm.v1.kv_cache_interface import FullAttentionSpec
     from vllm_fl.worker.model_runner import ModelRunnerFL
 
     block_size, kv_heads, heads = 128, 2, 4
-    storage = torch.zeros(2, 2, block_size, kv_heads, head_size,
+    storage = torch.zeros(2, 3, block_size, kv_heads, head_size,
                           dtype=torch.bfloat16, device=device)
     group = SimpleNamespace(
         kv_cache_spec=FullAttentionSpec(block_size=128, num_kv_heads=kv_heads,
@@ -41,28 +42,29 @@ def test_ascend_attention_forward_keeps_engine_cache(ascend_runtime, head_size):
     )
     runner = SimpleNamespace(_kv_cache_spec_attn_group_iterator=lambda: iter([group]),
                              cache_config=SimpleNamespace(cache_dtype="auto"))
-    ModelRunnerFL._update_hybrid_attention_mamba_layout(
-        runner, {"cache_test":storage}, [block_size],
-    )
+    if hybrid:
+        ModelRunnerFL._update_hybrid_attention_mamba_layout(
+            runner, {"cache_test":storage}, [block_size],
+        )
     caches = [storage[0], storage[1]]
-    assert all(cache.is_contiguous() for cache in caches)
+    assert all(cache.is_contiguous() != hybrid for cache in caches)
     impl = object.__new__(attention.AscendAttentionBackendImpl)
     impl.num_heads, impl.num_kv_heads, impl.head_size = heads, kv_heads, head_size
     impl.scale, impl.sliding_window = head_size**-0.5, None
     impl.attn_type = attention.AttentionType.DECODER
     impl.key_cache = impl.value_cache = None
     layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0, layer_name="cache_test")
-    q = torch.randn(4, heads, head_size).bfloat16()
-    k, v = [torch.randn(4, kv_heads, head_size).bfloat16() for _ in range(2)]
+    q = torch.randn(130, heads, head_size).bfloat16()
+    k, v = [torch.randn(130, kv_heads, head_size).bfloat16() for _ in range(2)]
     mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), 1).to(device)
-    for start, end, state in [(0, 3, attention.AscendAttentionState.PrefillNoCache),
-                              (3, 4, attention.AscendAttentionState.DecodeOnly)]:
+    for start, end, state in [(0, 129, attention.AscendAttentionState.PrefillNoCache),
+                              (129, 130, attention.AscendAttentionState.DecodeOnly)]:
         metadata = attention.AscendMetadata(
             attn_state=state, num_actual_tokens=end-start,
             actual_seq_lengths_q=[end-start], seq_lens_list=[end],
             seq_lens=torch.tensor([end], dtype=torch.int32), attn_mask=mask,
             slot_mapping=torch.arange(128+start, 128+end, dtype=torch.int64, device=device),
-            block_tables=torch.tensor([[1]], dtype=torch.int32, device=device),
+            block_tables=torch.tensor([[1, 2]], dtype=torch.int32, device=device),
         )
         output = torch.empty(end-start, heads, head_size, dtype=q.dtype, device=device)
         impl.forward(layer, q[start:end].to(device), k[start:end].to(device),
@@ -75,8 +77,13 @@ def test_ascend_attention_forward_keeps_engine_cache(ascend_runtime, head_size):
             expected[pos-start] = (probabilities.T[:, :, None] * values).sum(0)
         torch.testing.assert_close(output.cpu(), expected, rtol=0.03, atol=0.02)
         assert impl.key_cache.data_ptr() == caches[0].data_ptr()
-        torch.testing.assert_close(caches[0][1, :end].cpu(), k[:end], rtol=0, atol=0)
-        torch.testing.assert_close(caches[1][1, :end].cpu(), v[:end], rtol=0, atol=0)
+        assert impl.key_cache.is_contiguous() and impl.value_cache.is_contiguous()
+        torch.testing.assert_close(caches[0][1:3].reshape(-1, kv_heads, head_size)[:end].cpu(), k[:end], rtol=0, atol=0)
+        torch.testing.assert_close(caches[1][1:3].reshape(-1, kv_heads, head_size)[:end].cpu(), v[:end], rtol=0, atol=0)
+        # Another hybrid group owns physical block zero. Its writes must not
+        # touch attention pages one and two in the same raw allocation.
+        caches[0][0].fill_(float("nan"))
+        caches[1][0].fill_(float("nan"))
 
 
 @pytest.mark.parametrize("head_size", [72, 128])
@@ -333,7 +340,8 @@ def ascend_runtime(backend, request, monkeypatch):
 
 @pytest.mark.parametrize("batch, live_batch", [(1, 1), (2, 2), (4, 3), (4, 1)])
 @pytest.mark.parametrize("windows", [(8,), (None, 8, 64)], ids=["fia", "pa_fia"])
-def test_ascend_attention_graph_replay(ascend_runtime, batch, live_batch, windows):
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_ascend_attention_graph_replay(ascend_runtime, batch, live_batch, windows, hybrid):
     attention, state, device = ascend_runtime
     impl_cls = attention.AscendAttentionBackendImpl
     state.set_ascend_graph_params([batch])
@@ -341,6 +349,12 @@ def test_ascend_attention_graph_replay(ascend_runtime, batch, live_batch, window
     query = torch.randn(batch, 4, 128, dtype=torch.bfloat16, device=device)
     key = torch.randn(4, 128, 2, 128, dtype=query.dtype, device=device)
     value = torch.randn_like(key)
+    storage = torch.empty(2, *key.shape, dtype=key.dtype, device=device)
+    if hybrid:
+        page = key.shape[1:].numel()
+        storage.as_strided_(storage.shape, (page, 2*page, *storage.stride()[2:]))
+    storage[0].copy_(key)
+    storage[1].copy_(value)
     mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), 1).to(device)
     layers = []
     for index, window in enumerate(windows):
@@ -348,7 +362,7 @@ def test_ascend_attention_graph_replay(ascend_runtime, batch, live_batch, window
         impl.num_heads, impl.num_kv_heads, impl.head_size = 4, 2, 128
         impl.scale = 128**-0.5
         impl.sliding_window = window
-        impl.key_cache, impl.value_cache = key, value
+        impl._bind_native_cache_views((storage[0], storage[1]))
         layers.append((f"layer{index}", impl, torch.empty_like(query)))
 
     def metadata(lengths, swapped=False):
