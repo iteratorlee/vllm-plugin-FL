@@ -82,13 +82,13 @@ def dense_attention_view(raw, spec, shape):
     return raw[offset:].view(spec.dtype).view(shape)
 
 
-def dense_mamba_views(raw, spec, num_blocks):
+def dense_mamba_views(raw, shapes, dtypes, num_blocks):
     """Group each state type densely so NPU gathers only requested rows."""
     if raw.element_size() != 1:
         raise ValueError("Ascend hybrid cache requires byte backing")
     states = []
     offset = 0
-    for shape, dtype in zip(spec.shapes, spec.dtypes):
+    for shape, dtype in zip(shapes, dtypes):
         end = offset + num_blocks * math.prod(shape) * get_dtype_size(dtype)
         if offset % get_dtype_size(dtype) or end > raw.nbytes:
             raise ValueError("Invalid Ascend hybrid state backing")

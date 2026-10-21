@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
 from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
-    causal_conv1d_torch,
+    causal_conv1d_fn_cpu,
     causal_conv1d_update_torch,
 )
 
@@ -81,7 +81,7 @@ def gdn_prefill(
     num_key_heads, num_value_heads, head_k_dim, head_v_dim,
 ):
     """Update one prefill sequence and its supplied [H,V,K] recurrent row."""
-    x = causal_conv1d_torch(
+    x = causal_conv1d_fn_cpu(
         x.T, conv_weights, conv_bias, conv_state,
         torch.tensor([0, x.shape[0]], device=x.device),
         cache_index, has_initial_state, activation,

@@ -116,13 +116,19 @@ class GraphRuntimeController:
 def get_graph_capture(default_capture):
     """Use rc1's separate NPU capture stream; retain the caller elsewhere."""
     @contextmanager
-    def capture(device):
+    def capture(device, graph_capture_context=None):
         if current_platform.device_type != "npu":
-            with default_capture(device=device) as context:
+            kwargs = (
+                {"graph_capture_context": graph_capture_context}
+                if graph_capture_context is not None else {}
+            )
+            with default_capture(device=device, **kwargs) as context:
                 yield context
             return
         device_fn = current_platform.torch_device_fn
-        context = GraphCaptureContext(device_fn.Stream(device=device))
+        context = graph_capture_context or GraphCaptureContext(
+            device_fn.Stream(device=device)
+        )
         current_stream = device_fn.current_stream()
         if context.stream != current_stream:
             context.stream.wait_stream(current_stream)

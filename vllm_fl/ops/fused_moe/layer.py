@@ -1,23 +1,23 @@
 # Copyright (c) 2025 BAAI. All rights reserved.
-# Adapted from vllm/model_executor/layers/fused_moe/layer.py (v0.24.0)
+# Adapted from vllm/model_executor/layers/fused_moe/layer.py (v0.28.0)
 
 import vllm.model_executor.layers.fused_moe as _fused_moe_pkg
-
-# Save the original FusedMoE factory BEFORE any monkey-patching occurs.
-# custom_ops.py patches _fused_moe_pkg.FusedMoE = FusedMoEFL at runtime,
-# so calling _fused_moe_pkg.FusedMoE() inside FusedMoEFL would recurse
-# infinitely.  Capturing it here breaks the cycle.
-_OrigFusedMoE = _fused_moe_pkg.FusedMoE
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
-from vllm.logger import init_logger
 
 from .fused_moe_utils import select_unquantized_moe_backend_oot
 from vllm_fl.ops.fused_moe.router import replace_router_with_fl
 
+# Save the original FusedMoE factory BEFORE any monkey-patching occurs.
+# Capture it before custom_ops.py replaces the package factory, avoiding
+# recursion when FusedMoEFL delegates to the upstream implementation.
+_OrigFusedMoE = getattr(_fused_moe_pkg, "FusedMoEFactory", None)
+if _OrigFusedMoE is None:
+    _OrigFusedMoE = _fused_moe_pkg.FusedMoE
 
 logger = init_logger(__name__)
 
@@ -47,7 +47,7 @@ def FusedMoEFL(*args, **kwargs) -> MoERunner:
 
     In vllm 0.24.0, FusedMoE changed from a class to a factory function that
     returns a MoERunner instance.  FusedMoEFL mirrors this pattern: it
-    delegates to the standard FusedMoE() factory, replaces the router, and
+    delegates to the standard upstream factory, replaces the router, and
     substitutes the FL experts only for unquantized MoE.
 
     Registration: op_registry_oot maps FusedMoE -> FusedMoEFL so that all

@@ -390,6 +390,47 @@ def test_non_npu_capture_uses_existing_policy(monkeypatch):
     assert calls == ["device"]
 
 
+def test_npu_capture_reuses_supplied_context(monkeypatch):
+    calls = []
+    runtime, platform = _runtime(monkeypatch, calls)
+    previous = platform.torch_device_fn.current_stream()
+    capture_stream = NS(wait_stream=lambda stream: calls.append(("wait", stream)))
+    supplied = NS(stream=capture_stream)
+
+    @contextmanager
+    def use_stream(stream):
+        calls.append(("enter", stream))
+        yield
+        calls.append(("exit", stream))
+
+    platform.torch_device_fn.stream = use_stream
+    with runtime.get_graph_capture(None)(
+        "device", graph_capture_context=supplied
+    ) as context:
+        assert context is supplied
+    assert calls == [
+        ("wait", previous),
+        ("enter", capture_stream),
+        ("exit", capture_stream),
+    ]
+
+
+def test_non_npu_capture_forwards_supplied_context(monkeypatch):
+    runtime, platform = _runtime(monkeypatch, [])
+    platform.device_type = "cuda"
+    supplied = object()
+
+    @contextmanager
+    def existing_capture(*, device, graph_capture_context):
+        assert device == "device"
+        yield graph_capture_context
+
+    with runtime.get_graph_capture(existing_capture)(
+        "device", graph_capture_context=supplied
+    ) as context:
+        assert context is supplied
+
+
 def _configure(monkeypatch, *, breakable=False):
     # Extract the standalone helper, avoiding PlatformFL's device discovery and
     # unrelated operator registration at import time on another vendor's CI.

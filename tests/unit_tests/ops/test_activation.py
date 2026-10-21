@@ -88,6 +88,6 @@ def test_fused_moe_clamped_silu_uses_upstream_math(monkeypatch):
         activation_module.MoEActivation.SILU,
         output_tensor,
         input_tensor,
-        clamp_limit=7.0,
+        activation_config=activation_module.ApplyMoEActivationConfig(clamp_limit=7.0),
     )
     ordinary_silu.assert_not_called()

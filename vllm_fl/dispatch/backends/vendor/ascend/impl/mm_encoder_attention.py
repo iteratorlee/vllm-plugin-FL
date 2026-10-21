@@ -17,18 +17,12 @@
 # limitations under the License.
 #
 
-import einops
 import torch
-import torch.nn.functional as F
-import torch_npu
-from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 
-MIN_PAD_SIZE = 64  # min_size to pad weight
-MAX_PAD_SIZE = 128  # max_size to pad weight
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 
 
 class AscendMMEncoderAttention(MMEncoderAttention):
-
     def reshape_qkv_to_3d(
         self,
         query: torch.Tensor,
@@ -45,7 +39,6 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         query = query.view(bsz * q_len, self.num_heads, self.head_size)
         key = key.view(bsz * kv_len, self.num_kv_heads, self.head_size)
         value = value.view(bsz * kv_len, self.num_kv_heads, self.head_size)
-        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         if (num_repeat := self.num_queries_per_kv) > 1:
             # Handle MQA and GQA
             key = torch.repeat_interleave(key, num_repeat, dim=1)
@@ -54,62 +47,65 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         return query, key, value
 
     def forward_oot(
-            self,
-            query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
-            cu_seqlens: torch.Tensor | None = None,
-            max_seqlen: torch.Tensor
-        | None = None,  # Only used for Flash Attention
-        sequence_lengths: torch.Tensor | None = None,
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,  # Only used for Flash Attention
+        sequence_lengths: torch.Tensor
+        | None = None,  # Only used for FlashInfer CuDNN backend
     ):
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
         is_reshaped = query.dim() == 4
 
-        if cu_seqlens is None:
-            cu_seqlens = torch.arange(0, (bsz + 1) * q_len,
-                                      step=q_len,
-                                      dtype=torch.int32,
-                                      device="cpu")
-        cu_seqlens = torch.diff(cu_seqlens).to("cpu")
-
         # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
         q, k, v = self.reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
 
-        enable_pad = (self.head_size > MIN_PAD_SIZE and self.head_size < MAX_PAD_SIZE)
+        # Pure-PyTorch scaled dot-product attention (matmul path).
+        # Avoids _npu_flash_attention_unpad which can trigger DDR
+        # out-of-range aicore errors on some model configurations.
+        # q,k,v: [B*S, H, D] -> [B, H, S, D] for matmul
+        q4d = q.view(bsz, -1, self.num_heads, self.head_size).transpose(1, 2)
+        k4d = k.view(bsz, -1, self.num_heads, self.head_size).transpose(1, 2)
+        v4d = v.view(bsz, -1, self.num_heads, self.head_size).transpose(1, 2)
 
-        if enable_pad:
-            origin_shape = q.shape[-1]
-            pad_len = MAX_PAD_SIZE - origin_shape
-            # q, k, v: [b * s, head, head_dim] -> [b * s, head, MAX_PAD_SIZE]
-            q = F.pad(q, (0, pad_len), mode="constant", value=0)
-            k = F.pad(k, (0, pad_len), mode="constant", value=0)
-            v = F.pad(v, (0, pad_len), mode="constant", value=0)
+        def _sdpa(qx, kx, vx):
+            # The encoder's memory profile uses a much longer sequence than
+            # normal images. Bound temporary scores while keeping every key
+            # visible to each query and preserving each image/window boundary.
+            outputs = []
+            for start in range(0, qx.size(-2), 256):
+                query_chunk = qx[..., start : start + 256, :]
+                aw = torch.matmul(query_chunk, kx.transpose(-2, -1)) * self.scale
+                aw = torch.softmax(aw.float(), dim=-1).to(qx.dtype)
+                outputs.append(torch.matmul(aw, vx))
+            return torch.cat(outputs, dim=-2)
 
-        context_layer = torch.empty_like(q)
-
-        # operator requires pta version >= 2.5.1
-        torch_npu._npu_flash_attention_unpad(
-            query=q,
-            key=k,
-            value=v,
-            seq_len=cu_seqlens,
-            scale_value=self.scale,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            out=context_layer,
-        )
-
-        if enable_pad:
-            context_layer = context_layer[..., :origin_shape]
+        if cu_seqlens is not None:
+            # Block-diagonal (windowed) attention: vision encoders restrict
+            # attention to within each cu_seqlens segment (window / image).
+            # Computing full dense attention here scrambles spatial features
+            # across window boundaries and corrupts image understanding.
+            # Mirror vllm's torch_sdpa_wrapper: split along the sequence dim
+            # and attend within each segment independently.
+            lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+            q_chunks = torch.split(q4d, lens, dim=2)
+            k_chunks = torch.split(k4d, lens, dim=2)
+            v_chunks = torch.split(v4d, lens, dim=2)
+            outs = [
+                _sdpa(qi, ki, vi) for qi, ki, vi in zip(q_chunks, k_chunks, v_chunks)
+            ]
+            context_layer = torch.cat(outs, dim=2)  # [B, H, S, D]
+        else:
+            context_layer = _sdpa(q4d, k4d, v4d)
 
         if is_reshaped:
-            context_layer = einops.rearrange(context_layer,
-                                             "(b s) h d -> b s h d",
-                                             b=bsz).contiguous()
+            # [B, H, S, D] -> [B, S, H, D]
+            context_layer = context_layer.transpose(1, 2).contiguous()
         else:
-            context_layer = einops.rearrange(context_layer,
-                                             "(b s) h d -> b s (h d)",
-                                             b=bsz).contiguous()
+            # [B, H, S, D] -> [B, S, H*D]
+            context_layer = context_layer.transpose(1, 2).contiguous()
+            context_layer = context_layer.view(bsz, -1, self.num_heads * self.head_size)
         return context_layer

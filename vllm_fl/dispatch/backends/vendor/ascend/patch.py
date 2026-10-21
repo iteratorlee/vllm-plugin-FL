@@ -2,6 +2,8 @@
 
 import logging
 
+import torch
+
 logger = logging.getLogger(__name__)
 _patches_applied = False
 
@@ -11,6 +13,9 @@ def apply_ascend_patches():
     if _patches_applied:
         return
     _patches_applied = True
+    # torch-npu 2.10 does not implement the unified allocator entry point used
+    # by vLLM 0.28's warmup and workspace locking.
+    torch.accelerator.empty_cache = torch.npu.empty_cache
     # Patch modules for Ascend platform
     patch_causal_conv1d()
     patch_fla_ops()
@@ -57,6 +62,7 @@ def patch_vision_position_interpolation():
 def patch_gdn():
     """Keep the current upstream GDN model, replacing its numerical core."""
     from vllm.model_executor.custom_op import PluggableLayer
+    from vllm.model_executor.warmup import kernel_warmup
 
     from .impl.gdn import AscendQwenGatedDeltaNetAttention
 
@@ -64,6 +70,12 @@ def patch_gdn():
         _decorated_layer_cls=AscendQwenGatedDeltaNetAttention,
         name="QwenGatedDeltaNetAttention",
     )
+    # vLLM 0.28 also warms Qwen Triton kernels globally, independently of the
+    # layer hook. Ascend's replacement never executes those kernels.
+    def skip_qwen_triton_warmup(runner, model_config):
+        return
+
+    kernel_warmup.qwen_triton_warmup = skip_qwen_triton_warmup
 
 def patch_causal_conv1d():
     """Patch causal_conv1d ops with Ascend implementations."""

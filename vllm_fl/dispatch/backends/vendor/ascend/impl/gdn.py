@@ -16,6 +16,21 @@ _gdn_prefill = CachedOp("gdn_prefill")
 class AscendQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     """Non-speculative reference path, sharing eager and captured math."""
 
+    def bind_kv_cache(self, kv_cache):
+        from vllm_fl.kv_cache.ascend.hybrid import (
+            dense_mamba_views,
+            uses_dense_hybrid_cache,
+        )
+
+        if not uses_dense_hybrid_cache(self.model_config):
+            return super().bind_kv_cache(kv_cache)
+        # vLLM 0.28 binds raw byte pages through the layer. Preserve Ascend's
+        # dense convolution/SSM slabs over the scheduler's shared allocation.
+        self.kv_cache = tuple(dense_mamba_views(
+            kv_cache.view(-1), self.get_state_shape(), self.get_state_dtype(),
+            kv_cache.shape[0],
+        ))
+
     def _warmup_prefill_kernels(self, *args, **kwargs):
         # There are no Triton prefill kernels in this reference implementation.
         return

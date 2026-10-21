@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.fused_moe.activation import (
+    ApplyMoEActivationConfig,
     MoEActivation,
     apply_moe_activation as upstream_apply_moe_activation,
 )
@@ -42,7 +43,9 @@ def apply_moe_activation(
                 activation,
                 output,
                 input,
-                clamp_limit=clamp_limit,
+                activation_config=ApplyMoEActivationConfig(
+                    clamp_limit=clamp_limit, alpha=alpha, beta=beta,
+                ),
             )
         output.copy_(_silu_and_mul(None, input))
     elif activation == MoEActivation.GELU:
